@@ -31,6 +31,19 @@ should be considered stable but subject to additive change.
 
 ### Added
 
+- **Excessive code-comment verbosity heuristic (issue #143):** new
+  [`code_comments.py`](src/reviewgate/core/code_comments.py) core module
+  emits deterministic `oversized_comment_block`, `excessive_comment_lines`,
+  and `comment_heavy_diff` warnings from the added lines of
+  `ChangedFile.patch` only. Eligibility reuses the categorizer's
+  `source` + `human_authored` verdict; a conservative lexical scanner
+  recognizes full-line `#` / `//` / `/* */` comments in Python, Shell, Go,
+  JS/TS, Java, C/C++, C#, and Rust while never counting string literals
+  (including Python docstrings) or trailing comments. Configured via the
+  new `policy.code_comments` block (warn/fail thresholds, ratio sample-size
+  guard, `enabled` toggle); adds `comment_lines_added`, `code_lines_added`,
+  `largest_comment_block_lines`, and `comment_ratio` stats when enabled,
+  and maps no new labels (existing §10.13 aggregation is unchanged).
 - **OSS polish (issue #126):** [`GOVERNANCE.md`](GOVERNANCE.md); canonical
   hosted-stack local guide [`docs/HOSTED_LOCAL.md`](docs/HOSTED_LOCAL.md) with
   README cross-links (including Dependabot, already configured in

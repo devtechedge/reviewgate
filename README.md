@@ -208,6 +208,17 @@ policy:                              # §10.10
   require_linked_issue: true
   require_human_summary: true
   fail_on_risky_paths_without_context: true
+  code_comments:                     # issue #143 — comment-verbosity limits
+    enabled: true
+    warn:
+      max_block_lines: 10
+      max_total_lines: 60
+      max_comment_ratio: 0.45
+    fail:
+      max_block_lines: 25
+      max_total_lines: 150
+      max_comment_ratio: 0.70
+    min_added_source_lines: 20
 
 risky_paths:                         # §10.6 — defaults already cover migrations,
   - "**/migrations/**"               #         auth, billing, payments, infra,
@@ -253,6 +264,7 @@ module ties back to a §-numbered section of `docs/DESIGN.md`:
 | [`linked_issue.py`](src/reviewgate/core/linked_issue.py) | Linked-issue / ticket reference detection | §10.10 |
 | [`risky_paths.py`](src/reviewgate/core/risky_paths.py) | Risky-paths-without-rationale heuristic | §10.6, §10.10 |
 | [`mixed_concern.py`](src/reviewgate/core/mixed_concern.py) | Mixed-concern category clusters | §10.11 |
+| [`code_comments.py`](src/reviewgate/core/code_comments.py) | Excessive added-comment verbosity (blocks, totals, ratio) | issue #143 |
 | [`aggregate.py`](src/reviewgate/core/aggregate.py) | PASS / WARN / FAIL aggregation | §10.13 |
 | [`report.py`](src/reviewgate/core/report.py) | Suggested-label assembly from warnings + config | §13.9, §12 |
 | [`cli.py`](src/reviewgate/core/cli.py) | `reviewgate-core` console script for fixture-driven runs | §5.1, §25 M1 |
@@ -267,6 +279,9 @@ module ties back to a §-numbered section of `docs/DESIGN.md`:
 | `missing_linked_issue` | medium | no `#123`, `GH-123`, `fixes #…`, external tracker URL, or `ABC-123` | §10.10 |
 | `risky_paths_without_rationale` | high | risky paths touched and PR body has no justification | §10.10 |
 | `mixed_concerns` | medium | suspicious category cluster (billing + auth + infra, etc.) | §10.11 |
+| `oversized_comment_block` | medium / high | a newly-added consecutive full-line comment block reaches `policy.code_comments.warn / fail.max_block_lines` | issue #143 |
+| `excessive_comment_lines` | medium / high | newly-added full-line comment lines across eligible files reach `policy.code_comments.warn / fail.max_total_lines` | issue #143 |
+| `comment_heavy_diff` | medium / high | added comment-to-source ratio reaches `policy.code_comments.warn / fail.max_comment_ratio` (only at or above `min_added_source_lines`) | issue #143 |
 | `config_invalid` | low | `.reviewgate.yml` failed to parse; engine ran with defaults | §12 |
 
 Verdict aggregation (§10.13):
@@ -280,6 +295,40 @@ def baseline_reviewability(warnings):
     if high == 1 or medium >= 2: return "WARN"
     return "PASS"
 ```
+
+### Code-comment verbosity (issue #143)
+
+The `code_comments` heuristic measures how much commentary a PR
+**introduces** -- never whether a comment is useful, correct, or who or
+what wrote it. It reads only the optional unified diff in
+`ChangedFile.patch`: deleted and context lines are ignored, so a PR is
+never penalised for historical comments it did not touch.
+
+Scope and parsing rules (conservative by design; false negatives are
+preferred):
+
+* Only files the categorizer marks `source` and `human_authored` are
+  analyzed -- docs, generated, vendored, minified, snapshot, asset,
+  lockfile, and manifest files are excluded.
+* Supported comment syntaxes: `#` (Python, Shell), `//` and `/* */`
+  (Go, JavaScript, TypeScript, Java, C, C++, C#, Rust). A small lexical
+  scanner tracks string literals so `url = "https://example.com"` and
+  `pattern = "#[a-z]+"` are never miscounted.
+* A line counts as a comment only when it is a full-line comment.
+  Trailing (inline) comments are not counted in this MVP.
+* Python docstrings are string literals and may be runtime data, so they
+  are never counted as comments.
+* A comment block is a run of consecutive added comment lines; blank
+  lines, code lines, and pre-existing context lines terminate it.
+* `comment_ratio = comment_lines_added / added non-blank source lines`,
+  reported to 4 decimal places in `stats` and warning evidence.
+
+The ratio dimension stays silent while a PR adds fewer than
+`min_added_source_lines` (default 20) non-blank source lines, so a
+one-line work-around comment cannot produce a misleading 50% ratio;
+block and total-volume dimensions stay active on small diffs. Set
+`policy.code_comments.enabled: false` to disable the heuristic entirely;
+no warnings or comment stats are emitted in that case.
 
 ---
 
