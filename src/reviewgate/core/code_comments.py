@@ -497,11 +497,17 @@ def _iter_patch_lines(patch: str) -> list[_PatchLine]:
     they do not exist in the resulting file, so surrounding added lines
     become adjacent. Gap content is preserved so hunk headers can be
     parsed; a mid-file hunk is skipped rather than assumed normal.
+
+    File headers are recognised by the trailing space in ``+++ `` and
+    ``--- ``, the same discriminator ``parse_diff_right_side`` uses.
+    Matching the bare ``+++`` prefix would misread an added ``++i`` (which
+    the diff renders as ``+++i``) as a header, dropping a code line and
+    resetting lexical state mid-run.
     """
 
     extracted: list[_PatchLine] = []
     for line in patch.splitlines():
-        if line.startswith("+++") or line.startswith("---"):
+        if line.startswith("+++ ") or line.startswith("--- "):
             extracted.append(_PatchLine("gap", line))
         elif line.startswith("+"):
             extracted.append(_PatchLine("added", line[1:]))
