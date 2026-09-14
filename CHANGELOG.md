@@ -44,6 +44,11 @@ should be considered stable but subject to additive change.
   guard, `enabled` toggle); adds `comment_lines_added`, `code_lines_added`,
   `largest_comment_block_lines`, and `comment_ratio` stats when enabled,
   and maps no new labels (existing §10.13 aggregation is unchanged).
+  Follow-up to the #144 review: unchanged context lines participate in
+  lexical classification without being tallied; hunk gaps reset scanner
+  state; JS/Go backtick strings and shell quotes/heredocs carry across
+  lines; `oversized_comment_block` is one PR-level warning for the
+  maximum block (filename in evidence), matching `size_warnings`.
 - **OSS polish (issue #126):** [`GOVERNANCE.md`](GOVERNANCE.md); canonical
   hosted-stack local guide [`docs/HOSTED_LOCAL.md`](docs/HOSTED_LOCAL.md) with
   README cross-links (including Dependabot, already configured in

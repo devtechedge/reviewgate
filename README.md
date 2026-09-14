@@ -279,7 +279,7 @@ module ties back to a §-numbered section of `docs/DESIGN.md`:
 | `missing_linked_issue` | medium | no `#123`, `GH-123`, `fixes #…`, external tracker URL, or `ABC-123` | §10.10 |
 | `risky_paths_without_rationale` | high | risky paths touched and PR body has no justification | §10.10 |
 | `mixed_concerns` | medium | suspicious category cluster (billing + auth + infra, etc.) | §10.11 |
-| `oversized_comment_block` | medium / high | a newly-added consecutive full-line comment block reaches `policy.code_comments.warn / fail.max_block_lines` | issue #143 |
+| `oversized_comment_block` | medium / high | PR-wide maximum newly-added consecutive full-line comment block reaches `policy.code_comments.warn / fail.max_block_lines` (one warning, filename in evidence) | issue #143 |
 | `excessive_comment_lines` | medium / high | newly-added full-line comment lines across eligible files reach `policy.code_comments.warn / fail.max_total_lines` | issue #143 |
 | `comment_heavy_diff` | medium / high | added comment-to-source ratio reaches `policy.code_comments.warn / fail.max_comment_ratio` (only at or above `min_added_source_lines`) | issue #143 |
 | `config_invalid` | low | `.reviewgate.yml` failed to parse; engine ran with defaults | §12 |
@@ -300,9 +300,12 @@ def baseline_reviewability(warnings):
 
 The `code_comments` heuristic measures how much commentary a PR
 **introduces** -- never whether a comment is useful, correct, or who or
-what wrote it. It reads only the optional unified diff in
-`ChangedFile.patch`: deleted and context lines are ignored, so a PR is
-never penalised for historical comments it did not touch.
+what wrote it. It reads the optional unified diff in
+`ChangedFile.patch`. Only added lines contribute to metrics; deleted
+lines are dropped. Unchanged context lines are scanned so lexical state
+(open `/* */` blocks, strings, heredocs) stays accurate, but they are
+never tallied. Hunk headers and other diff metadata reset lexical state
+because the post-image between hunks is unknown.
 
 Scope and parsing rules (conservative by design; false negatives are
 preferred):
@@ -312,14 +315,19 @@ preferred):
   lockfile, and manifest files are excluded.
 * Supported comment syntaxes: `#` (Python, Shell), `//` and `/* */`
   (Go, JavaScript, TypeScript, Java, C, C++, C#, Rust). A small lexical
-  scanner tracks string literals so `url = "https://example.com"` and
-  `pattern = "#[a-z]+"` are never miscounted.
+  scanner tracks string literals -- including JS/Go backtick strings and
+  shell quotes/heredocs -- so `url = "https://example.com"`,
+  `pattern = "#[a-z]+"`, template-literal bodies, and heredoc bodies are
+  never miscounted.
 * A line counts as a comment only when it is a full-line comment.
   Trailing (inline) comments are not counted in this MVP.
 * Python docstrings are string literals and may be runtime data, so they
   are never counted as comments.
 * A comment block is a run of consecutive added comment lines; blank
   lines, code lines, and pre-existing context lines terminate it.
+* `oversized_comment_block` emits at most one warning per PR, for the
+  largest added consecutive comment block, with the filename in evidence
+  (the same one-warning-per-dimension convention as `size_warnings`).
 * `comment_ratio = comment_lines_added / added non-blank source lines`,
   reported to 4 decimal places in `stats` and warning evidence.
 

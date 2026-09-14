@@ -2,12 +2,16 @@
 
 Locks the deterministic excessive-comment-verbosity heuristic end to end:
 
-* **Added-lines-only**: deleted, context, and diff-metadata lines are never
-  observable by the heuristic, so it can never judge repository history
-  outside the PR's added lines.
-* **Conservative classification**: string content, docstrings, trailing
+* **Added-lines-only metrics**: deleted lines are dropped; context lines
+  are scanned for lexical state but never tallied, so a PR is never
+  penalised for historical comments it did not touch.
+* **Conservative classification**: string content (including JS/Go
+  backtick strings and shell quotes/heredocs), docstrings, trailing
   comments, and unsupported languages are never counted; false negatives
   are preferred over false positives.
+* **One warning per dimension**: ``oversized_comment_block`` is a single
+  PR-level warning for the maximum block (filename in evidence), matching
+  :func:`reviewgate.core.size.size_warnings`.
 * **Threshold ladder**: warn/fail thresholds are inclusive lower bounds,
   the same convention as :func:`reviewgate.core.size.size_warnings`, and
   the ratio dimension honors the minimum sample-size guard.
@@ -130,8 +134,9 @@ def _analyze(
 
 class TestAddedLinesOnly:
     def test_deleted_and_context_lines_are_ignored(self) -> None:
-        """Deleted/context comment lines never count; this is the #143 core
-        regression: the feature sees the PR's added lines, nothing else."""
+        """Deleted comment lines never count; context comments are scanned
+        for lexical state but not tallied. The feature measures the PR's
+        added lines, nothing else."""
 
         patch = "\n".join(
             [
@@ -296,6 +301,153 @@ class TestBlockSemantics:
         assert result.stats.largest_comment_block_lines == 2
 
 
+# --- context-aware lexical state (PR #144 review) --------------------------------
+
+
+class TestContextAwareLexicalState:
+    def test_context_closer_ends_block_comment_before_added_code(self) -> None:
+        """Reviewer reproduction: added `/*`, unchanged `*/`, then added code.
+        Only the added opener is commentary; carrying `in_block_comment` past
+        the context closer would count every `int` line as a comment."""
+
+        patch = "\n".join(
+            [
+                "@@ -1,3 +1,15 @@",
+                "+/*",
+                " existing text",
+                " */",
+                *[f"+int value_{i} = {i};" for i in range(12)],
+            ]
+        )
+        result = _analyze([("src/main.c", patch, _row("src/main.c"))])
+        assert result.stats.comment_lines_added == 1
+        assert result.stats.code_lines_added == 12
+        assert result.stats.largest_comment_block_lines == 1
+        assert result.warnings == []
+
+    def test_hash_inside_context_opened_docstring_is_not_a_comment(self) -> None:
+        """Inverse: a triple-quoted string opened by context must suppress
+        added `#` lines, matching the documented docstring contract."""
+
+        patch = "\n".join(
+            [
+                "@@ -1,3 +1,4 @@",
+                ' """',
+                "+# looks like a comment but is string content",
+                " body",
+                ' """',
+            ]
+        )
+        result = _analyze([("src/app.py", patch, _row("src/app.py"))])
+        assert result.stats.comment_lines_added == 0
+        assert result.warnings == []
+
+    def test_context_opener_makes_added_block_body_comments(self) -> None:
+        """Lines added inside an already-open `/*` *are* new commentary."""
+
+        patch = "\n".join(
+            [
+                "@@ -1,3 +1,5 @@",
+                " /*",
+                "+ * added inside existing block",
+                "+ * another",
+                " */",
+                "+int x = 0;",
+            ]
+        )
+        result = _analyze([("src/main.c", patch, _row("src/main.c"))])
+        assert result.stats.comment_lines_added == 2
+        assert result.stats.code_lines_added == 1
+
+    def test_hunk_gap_resets_lexical_state(self) -> None:
+        """The post-image between hunks is unknown; carrying an unclosed
+        `/*` across `@@` would invent commentary. Reset is conservative."""
+
+        patch = "\n".join(
+            [
+                "@@ -1,1 +1,1 @@",
+                "+/* opened in hunk 1",
+                "@@ -20,1 +20,1 @@",
+                "+int x = 0;",
+            ]
+        )
+        result = _analyze([("src/main.c", patch, _row("src/main.c"))])
+        assert result.stats.comment_lines_added == 1
+        assert result.stats.code_lines_added == 1
+
+
+# --- multiline strings / heredocs (PR #144 review) -------------------------------
+
+
+class TestMultilineStrings:
+    def test_js_template_literal_body_is_not_commentary(self) -> None:
+        """Reviewer reproduction: unclosed backtick must carry state so
+        `// payload` lines inside a template literal are never comments."""
+
+        patch = _diff(
+            "const banner = `",
+            *["// payload %d" % i for i in range(12)],
+            "`;",
+        )
+        result = _analyze([("src/app.js", patch, _row("src/app.js"))])
+        assert result.stats.comment_lines_added == 0
+        assert result.warnings == []
+
+    def test_go_raw_string_body_is_not_commentary(self) -> None:
+        patch = _diff(
+            "banner := `",
+            *["// payload %d" % i for i in range(12)],
+            "`",
+        )
+        result = _analyze([("src/main.go", patch, _row("src/main.go"))])
+        assert result.stats.comment_lines_added == 0
+        assert result.warnings == []
+
+    def test_ts_template_literal_body_is_not_commentary(self) -> None:
+        patch = _diff("const banner = `", "// payload", "`;", "export {};")
+        result = _analyze([("src/app.ts", patch, _row("src/app.ts"))])
+        assert result.stats.comment_lines_added == 0
+
+    def test_shell_heredoc_hash_lines_are_not_comments(self) -> None:
+        patch = _diff("cat <<EOF", "# not a comment", "payload", "EOF", "echo done")
+        result = _analyze([("scripts/run.sh", patch, _row("scripts/run.sh"))])
+        assert result.stats.comment_lines_added == 0
+        assert result.stats.code_lines_added == 5
+
+    def test_shell_quoted_heredoc_hash_lines_are_not_comments(self) -> None:
+        patch = _diff("python - <<'PY'", "# still string content", "print(1)", "PY")
+        result = _analyze([("scripts/run.sh", patch, _row("scripts/run.sh"))])
+        assert result.stats.comment_lines_added == 0
+
+    def test_shell_dash_heredoc_strips_tabs_on_closer(self) -> None:
+        patch = _diff("cat <<-EOF", "\t# body", "\tEOF", "echo done")
+        result = _analyze([("scripts/run.sh", patch, _row("scripts/run.sh"))])
+        assert result.stats.comment_lines_added == 0
+        assert result.stats.code_lines_added == 4
+
+    def test_shell_single_quoted_multiline_hash_is_not_a_comment(self) -> None:
+        patch = _diff("x='", "# not a comment", "foo'", "echo hi")
+        result = _analyze([("scripts/run.sh", patch, _row("scripts/run.sh"))])
+        assert result.stats.comment_lines_added == 0
+        assert result.stats.code_lines_added == 4
+
+    def test_shell_double_quoted_multiline_hash_is_not_a_comment(self) -> None:
+        patch = _diff('x="', "# not a comment", 'foo"', "echo hi")
+        result = _analyze([("scripts/run.sh", patch, _row("scripts/run.sh"))])
+        assert result.stats.comment_lines_added == 0
+
+    def test_python_backslash_continued_string_is_not_a_comment(self) -> None:
+        patch = _diff('x = "hello \\', "# not a comment", 'world"')
+        result = _analyze([("src/app.py", patch, _row("src/app.py"))])
+        assert result.stats.comment_lines_added == 0
+
+    def test_comment_after_closed_template_literal_still_counts(self) -> None:
+        patch = _diff("const banner = `", "payload", "`;", "// real comment")
+        result = _analyze([("src/app.js", patch, _row("src/app.js"))])
+        assert result.stats.comment_lines_added == 1
+        assert result.stats.code_lines_added == 3
+
+
 # --- threshold ladder -------------------------------------------------------------
 
 
@@ -431,7 +583,10 @@ class TestThresholdLadder:
             (WARN_CODE_OVERSIZED_BLOCK, "medium")
         ]
 
-    def test_one_warning_per_file_for_oversized_blocks(self) -> None:
+    def test_one_block_warning_for_pr_wide_maximum(self) -> None:
+        """One code per dimension: two oversized files emit a single warning
+        for the PR-wide maximum (the larger block), not one vote per file."""
+
         patch_a = _diff(*["# a%d" % i for i in range(12)], *["x = %d" % i for i in range(100)])
         patch_b = _diff(*["# b%d" % i for i in range(30)], *["x = %d" % i for i in range(100)])
         result = _analyze(
@@ -440,13 +595,47 @@ class TestThresholdLadder:
                 ("src/b.py", patch_b, _row("src/b.py")),
             ]
         )
-        assert [w.code for w in result.warnings] == [
-            WARN_CODE_OVERSIZED_BLOCK,
-            WARN_CODE_OVERSIZED_BLOCK,
+        assert [w.code for w in result.warnings] == [WARN_CODE_OVERSIZED_BLOCK]
+        assert result.warnings[0].evidence["filename"] == "src/b.py"
+        assert result.warnings[0].evidence["comment_block_lines"] == 30
+        assert result.warnings[0].severity == "high"
+        assert result.stats.largest_comment_block_lines == 30
+
+    def test_split_warn_tier_blocks_do_not_escalate_verdict(self) -> None:
+        """Reviewer reproduction: two 10-line blocks + 50 code lines each
+        must emit one medium warning (PASS), not two mediums (WARN)."""
+
+        entries = []
+        for name in ("src/a.py", "src/b.py"):
+            patch = _diff(
+                *["# %s-%d" % (name, i) for i in range(10)],
+                *["x = %d" % i for i in range(50)],
+            )
+            entries.append((name, patch, _row(name)))
+        result = _analyze(entries)
+        assert [(w.code, w.severity) for w in result.warnings] == [
+            (WARN_CODE_OVERSIZED_BLOCK, "medium")
         ]
         assert result.warnings[0].evidence["filename"] == "src/a.py"
-        assert result.warnings[1].evidence["filename"] == "src/b.py"
-        assert result.warnings[1].severity == "high"
+        assert baseline_reviewability(result.warnings) == "PASS"
+
+    def test_two_fail_tier_blocks_do_not_cast_two_high_votes(self) -> None:
+        """Two fail-tier files must not supply two high-severity votes
+        (which would turn WARN into FAIL). Equal sizes pick the first file."""
+
+        entries = []
+        for name in ("src/a.py", "src/b.py"):
+            patch = _diff(
+                *["# %s-%d" % (name, i) for i in range(25)],
+                *["x = %d" % i for i in range(60)],
+            )
+            entries.append((name, patch, _row(name)))
+        result = _analyze(entries)
+        assert [(w.code, w.severity) for w in result.warnings] == [
+            (WARN_CODE_OVERSIZED_BLOCK, "high")
+        ]
+        assert result.warnings[0].evidence["filename"] == "src/a.py"
+        assert baseline_reviewability(result.warnings) == "WARN"
 
 
 # --- warning shape and determinism -------------------------------------------------

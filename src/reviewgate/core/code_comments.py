@@ -3,8 +3,8 @@
 Detects *objective volume* signals in commentary a PR introduces, from the
 optional unified diffs in :attr:`reviewgate.core.schemas.ChangedFile.patch`:
 
-1. **Oversized consecutive comment blocks** -- a maximal run of consecutive
-   newly-added full-line comment lines in one eligible file.
+1. **Oversized consecutive comment blocks** -- the PR-wide maximum run of
+   consecutive newly-added full-line comment lines (filename in evidence).
 2. **Excessive total comment lines** -- newly-added full-line comment lines
    summed across all eligible files.
 3. **Comment-heavy diff** -- the ratio of newly-added comment lines to
@@ -16,10 +16,13 @@ measures comment *volume*, never comment *value*.
 
 Conservative-parsing contract (false negatives preferred):
 
-* Only **added** patch lines are read. Deleted, context, and metadata lines
-  (``@@`` hunks, ``+++`` headers, ``\\ No newline`` markers) are ignored, so
-  the heuristic can never see repository content outside the PR's added
-  lines.
+* Only **added** patch lines contribute to metrics. Deleted lines are
+  dropped (they are gone in the post-image, so surrounding added lines
+  become adjacent). Unchanged context lines are **scanned** so lexical
+  state (open ``/* */`` blocks, strings, heredocs) stays accurate, but
+  they are never tallied. Hunk headers and other diff metadata are
+  unknown regions: they reset lexical state and terminate comment-block
+  runs.
 * Only files the categorizer marks ``human_authored`` **and** ``source``,
   written in a supported language (by extension), are analyzed. Docs,
   generated, vendored, minified, snapshot, asset, lockfile, manifest, and
@@ -27,14 +30,20 @@ Conservative-parsing contract (false negatives preferred):
 * A line counts as a comment only when it is an *unmistakable full-line*
   comment (``#``, ``//``, or a ``/* ... */`` block line) at a lexical
   position where a comment can exist. A small single-pass scanner tracks
-  string literals, ``/* */`` block comments, and Python triple-quoted
-  strings so markers inside string content (``url = "https://example.com"``,
-  ``pattern = "#[a-z]+"``) are never miscounted.
+  string literals (including JS/Go backtick strings and shell quotes /
+  heredocs), ``/* */`` block comments, and Python triple-quoted strings
+  so markers inside string content (``url = "https://example.com"``,
+  ``pattern = "#[a-z]+"``, template-literal / heredoc bodies) are never
+  miscounted.
 * Inline (trailing) comments are **not** counted in this MVP, and neither
   are Python docstrings: docstrings are string literals and may be runtime
   data. Both decisions are documented false-negative trade-offs.
 * Blank lines terminate a block: a run of comment lines interrupted by a
   blank, code, or non-added diff line counts as separate, smaller blocks.
+
+Each volume dimension emits at most one warning per PR (the same
+convention as :mod:`reviewgate.core.size`): repeated evidence for one
+metric must not masquerade as independent risk signals.
 
 Pure: stdlib only, no I/O, no GitHub or LLM dependency (§4.1 boundary).
 """
@@ -42,7 +51,7 @@ Pure: stdlib only, no I/O, no GitHub or LLM dependency (§4.1 boundary).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Final
+from typing import Final, Literal
 
 from pydantic import Field
 
@@ -77,15 +86,14 @@ _SEVERITY_WARN: Final[WarningSeverity] = "medium"
 
 _SHELL_EXTENSIONS: Final[frozenset[str]] = frozenset({".sh", ".bash", ".zsh"})
 _PYTHON_EXTENSIONS: Final[frozenset[str]] = frozenset({".py"})
-_C_LIKE_EXTENSIONS: Final[frozenset[str]] = frozenset(
+# JS/TS/Go own backtick strings (template literals / raw strings). The rest
+# of the C-like family shares `//` and `/* */` but must not treat `` ` `` as
+# a string opener (Java, C, C++, C#, Rust).
+_JS_GO_EXTENSIONS: Final[frozenset[str]] = frozenset(
+    {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".go"}
+)
+_C_FAMILY_EXTENSIONS: Final[frozenset[str]] = frozenset(
     {
-        ".js",
-        ".jsx",
-        ".mjs",
-        ".cjs",
-        ".ts",
-        ".tsx",
-        ".go",
         ".java",
         ".c",
         ".h",
@@ -107,15 +115,27 @@ class _Profile:
     hash_comments: bool  # `#` line comments (Python, Shell)
     c_comments: bool  # `//` line comments and `/* */` block comments
     triple_strings: bool  # Python triple-quoted strings
+    backtick_strings: bool = False  # JS template literals / Go raw / shell `` ` ``
+    shell_quoting: bool = False  # quotes and heredocs span lines without `\`
 
 
 _PYTHON_PROFILE: Final[_Profile] = _Profile(
     hash_comments=True, c_comments=False, triple_strings=True
 )
 _SHELL_PROFILE: Final[_Profile] = _Profile(
-    hash_comments=True, c_comments=False, triple_strings=False
+    hash_comments=True,
+    c_comments=False,
+    triple_strings=False,
+    backtick_strings=True,
+    shell_quoting=True,
 )
-_C_LIKE_PROFILE: Final[_Profile] = _Profile(
+_JS_GO_PROFILE: Final[_Profile] = _Profile(
+    hash_comments=False,
+    c_comments=True,
+    triple_strings=False,
+    backtick_strings=True,
+)
+_C_FAMILY_PROFILE: Final[_Profile] = _Profile(
     hash_comments=False, c_comments=True, triple_strings=False
 )
 
@@ -132,8 +152,10 @@ def _profile_for(filename: str) -> _Profile | None:
         return _PYTHON_PROFILE
     if ext in _SHELL_EXTENSIONS:
         return _SHELL_PROFILE
-    if ext in _C_LIKE_EXTENSIONS:
-        return _C_LIKE_PROFILE
+    if ext in _JS_GO_EXTENSIONS:
+        return _JS_GO_PROFILE
+    if ext in _C_FAMILY_EXTENSIONS:
+        return _C_FAMILY_PROFILE
     return None
 
 
@@ -142,38 +164,72 @@ def _profile_for(filename: str) -> _Profile | None:
 
 @dataclass
 class _ScanState:
-    """Lexical state carried across the added lines of one file patch."""
+    """Lexical state carried across post-image lines of one file patch.
+
+    Context lines update this state without contributing to metrics. Hunk
+    gaps replace the instance entirely because the unseen region between
+    hunks is unknown.
+    """
 
     in_block_comment: bool = False  # inside a `/* ... */` block (C-like)
     triple_delimiter: str | None = None  # inside `"""` / `'''` (Python)
+    in_string: str | None = None  # active quote: `"`, `'`, or `` ` ``
+    string_raw: bool = False  # True: closer is unescaped (shell single quotes)
+    heredoc_delimiter: str | None = None  # shell heredoc body until this word
+    heredoc_strip: bool = False  # `<<-` strips leading tabs on the closer
 
 
 _KIND_COMMENT: Final[str] = "comment"
 _KIND_CODE: Final[str] = "code"
 _KIND_BLANK: Final[str] = "blank"
 
+_PatchKind = Literal["added", "context", "gap"]
+
+
+@dataclass(frozen=True)
+class _PatchLine:
+    """One unified-diff line classified for scanning vs tallying."""
+
+    kind: _PatchKind
+    content: str  # empty for gap
+
 
 def _scan_line(line: str, state: _ScanState, profile: _Profile) -> str:
-    """Classify one added line as ``comment`` / ``code`` / ``blank``.
+    """Classify one post-image line as ``comment`` / ``code`` / ``blank``.
 
-    Updates ``state`` in place so subsequent lines of the same file are
-    scanned in the right context. Only whole-line comment forms are ever
-    returned as :data:`_KIND_COMMENT`; trailing comments, string content,
-    and anything ambiguous fall into :data:`_KIND_CODE` (the conservative
-    bucket: non-blank, non-comment lines count as source lines).
+    Updates ``state`` in place so subsequent lines of the same file (added
+    *or* context) are scanned in the right context. Only whole-line comment
+    forms are ever returned as :data:`_KIND_COMMENT`; trailing comments,
+    string content, and anything ambiguous fall into :data:`_KIND_CODE`
+    (the conservative bucket: non-blank, non-comment lines count as source
+    lines when the caller tallies an added line).
     """
 
     stripped = line.strip()
     if not stripped:
         # A blank line never changes lexical state (a blank inside a block
-        # comment or triple-quoted string leaves both open) and terminates
+        # comment, string, or heredoc leaves it open) and terminates
         # comment-block runs at the caller.
         return _KIND_BLANK
+
+    if state.heredoc_delimiter is not None:
+        closer = line.lstrip("\t") if state.heredoc_strip else line
+        if closer == state.heredoc_delimiter:
+            state.heredoc_delimiter = None
+            state.heredoc_strip = False
+        return _KIND_CODE
 
     i = 0
     n = len(line)
     while i < n and line[i] in (" ", "\t"):
         i += 1
+
+    if state.in_string is not None:
+        i = _scan_string_rest(line, 0, state)
+        if state.in_string is not None or i >= len(line):
+            return _KIND_CODE
+        _scan_normal(line, i, state, profile)
+        return _KIND_CODE
 
     if state.triple_delimiter is not None:
         # Inside a Python triple-quoted string: string content is never a
@@ -181,9 +237,6 @@ def _scan_line(line: str, state: _ScanState, profile: _Profile) -> str:
         i = _scan_triple_rest(line, i, state)
         if state.triple_delimiter is not None or i >= len(line):
             return _KIND_CODE
-        # The string closed mid-line and real content follows; keep scanning
-        # so a string reopened on the same line leaves state accurate for
-        # later lines. The line itself still counts as code.
         _scan_normal(line, i, state, profile)
         return _KIND_CODE
 
@@ -224,41 +277,44 @@ def _scan_normal(line: str, i: int, state: _ScanState, profile: _Profile) -> str
     """Walk a line from index ``i`` through normal (non-comment) context.
 
     Consumes string literals so comment markers inside them are ignored,
-    opens ``/* */`` blocks and Python triple-quoted strings that continue
-    onto later lines, and always returns :data:`_KIND_CODE` -- by the time
-    this function runs, the line has already shown real (non-comment)
-    content or its leading token was not an unmistakable comment form.
+    opens ``/* */`` blocks, Python triple-quoted strings, backtick strings,
+    and shell heredocs that continue onto later lines, and always returns
+    :data:`_KIND_CODE` -- by the time this function runs, the line has
+    already shown real (non-comment) content or its leading token was not
+    an unmistakable comment form.
     """
 
     n = len(line)
-    quote: str | None = None  # active single-line quote character
     while i < n:
         ch = line[i]
-        if quote is not None:
-            if ch == "\\":
-                i += 2
-                continue
-            if ch == quote:
-                quote = None
-            i += 1
+        if profile.triple_strings and line[i : i + 3] in ('"""', "'''"):
+            delimiter = line[i : i + 3]
+            end = _find_triple_close(line, i + 3, delimiter)
+            if end == -1:
+                state.triple_delimiter = delimiter
+                return _KIND_CODE
+            i = end
             continue
-        if ch in ("\"", "'"):
-            if profile.triple_strings:
-                delimiter = line[i : i + 3]
-                if delimiter in ("\"\"\"", "'''"):
-                    end = _find_triple_close(line, i + 3, delimiter)
-                    if end == -1:
-                        state.triple_delimiter = delimiter
-                        return _KIND_CODE
-                    i = end
-                    continue
-            quote = ch
-            i += 1
+        if ch in ("'", '"'):
+            raw = profile.shell_quoting and ch == "'"
+            close = _find_quote_close(line, i + 1, ch, raw=raw)
+            if close == -1:
+                if profile.shell_quoting or _ends_with_backslash(line):
+                    state.in_string = ch
+                    state.string_raw = raw
+                return _KIND_CODE
+            i = close + 1
+            continue
+        if profile.backtick_strings and ch == "`":
+            close = _find_quote_close(line, i + 1, "`", raw=False)
+            if close == -1:
+                state.in_string = "`"
+                state.string_raw = False
+                return _KIND_CODE
+            i = close + 1
             continue
         if profile.c_comments and ch == "/":
             if line[i : i + 2] == "//":
-                # Trailing line comment: consumed, but not a full-line
-                # comment, so the line stays in the code bucket.
                 return _KIND_CODE
             if line[i : i + 2] == "/*":
                 close = line.find("*/", i + 2)
@@ -267,15 +323,110 @@ def _scan_normal(line: str, i: int, state: _ScanState, profile: _Profile) -> str
                     return _KIND_CODE
                 i = close + 2
                 continue
-        if not profile.hash_comments and ch == "`":
-            # Go raw strings / JS template literals: scan to the closing
-            # backtick; escapes are not honored inside raw strings but the
-            # difference is immaterial for comment detection.
-            close = line.find("`", i + 1)
-            i = n if close == -1 else close + 1
-            continue
+        if profile.hash_comments and ch == "#":
+            # Trailing hash comment: rest of the line is not code, so a
+            # `# cat <<EOF` comment must not open a heredoc.
+            return _KIND_CODE
+        if profile.shell_quoting:
+            opened = _try_open_heredoc(line, i, state)
+            if opened is not None:
+                i = opened
+                continue
         i += 1
     return _KIND_CODE
+
+
+def _find_quote_close(line: str, start: int, quote: str, *, raw: bool) -> int:
+    """Index of the next closer, or ``-1`` if it does not appear on this line.
+
+    When ``raw`` is false, a backslash skips the next character (JS template
+    literals, Python/C strings, shell double quotes). Go raw strings have no
+    escapes; honouring ``\\`` there is a false-negative (preferred).
+    """
+
+    i = start
+    n = len(line)
+    while i < n:
+        if not raw and line[i] == "\\":
+            i += 2
+            continue
+        if line[i] == quote:
+            return i
+        i += 1
+    return -1
+
+
+def _scan_string_rest(line: str, i: int, state: _ScanState) -> int:
+    """Consume the rest of a line inside a carried-over string literal.
+
+    Returns the index to continue scanning from. If the string closes on
+    this line, ``state`` returns to normal so the caller can re-scan the
+    remainder.
+    """
+
+    quote = state.in_string
+    if quote is None:  # pragma: no cover - guarded by caller
+        return i
+    close = _find_quote_close(line, i, quote, raw=state.string_raw)
+    if close == -1:
+        return len(line)
+    state.in_string = None
+    state.string_raw = False
+    return close + 1
+
+
+def _ends_with_backslash(line: str) -> bool:
+    """True when the line continues a quoted string with a trailing ``\\``."""
+
+    stripped = line.rstrip(" \t")
+    count = 0
+    idx = len(stripped) - 1
+    while idx >= 0 and stripped[idx] == "\\":
+        count += 1
+        idx -= 1
+    return count % 2 == 1
+
+
+def _try_open_heredoc(line: str, i: int, state: _ScanState) -> int | None:
+    """Open a shell heredoc starting at ``i`` and return the resume index.
+
+    Recognises ``<<EOF``, ``<<-EOF``, ``<<'EOF'``, ``<<"EOF"``, ``<<\\EOF``,
+    and the same forms with whitespace before the delimiter. ``<<<``
+    here-strings are ignored. Returns ``None`` when ``i`` is not a heredoc
+    operator; the caller then advances one character as usual.
+    """
+
+    if line[i : i + 2] != "<<":
+        return None
+    if line[i : i + 3] == "<<<":
+        return None
+    j = i + 2
+    strip = False
+    if j < len(line) and line[j] == "-":
+        strip = True
+        j += 1
+    while j < len(line) and line[j] in (" ", "\t"):
+        j += 1
+    if j >= len(line):
+        return None
+    quote = ""
+    if line[j] in ("'", '"', "\\"):
+        quote = line[j]
+        j += 1
+    start = j
+    while j < len(line) and (line[j].isalnum() or line[j] == "_"):
+        j += 1
+    if j == start:
+        return None
+    if quote in ("'", '"'):
+        if j >= len(line) or line[j] != quote:
+            return None
+        j += 1
+        state.heredoc_delimiter = line[start : j - 1]
+    else:
+        state.heredoc_delimiter = line[start:j]
+    state.heredoc_strip = strip
+    return j
 
 
 def _find_triple_close(line: str, start: int, delimiter: str) -> int:
@@ -328,28 +479,29 @@ class _FileTally:
     largest_block: int
 
 
-def _added_lines(patch: str) -> list[str | None]:
-    """Extract added line contents from a unified diff patch.
+def _iter_patch_lines(patch: str) -> list[_PatchLine]:
+    """Classify unified-diff lines into added / context / gap.
 
-    Returns one entry per patch line: the content of lines the PR adds,
-    and ``None`` for every line that represents a real pre-existing file
-    line or a hunk boundary (context lines, ``@@`` headers, ``+++``
-    metadata, ``\\ No newline`` markers). Deleted lines are dropped
-    entirely -- the PR removes them, so the surrounding added lines end up
-    adjacent in the resulting file. Callers use ``None`` to terminate
-    consecutive-comment-block runs, which keeps block counting about lines
-    that are actually adjacent in the new file and makes the heuristic
-    unable to observe anything outside the PR's added lines.
+    Added lines are the only ones that contribute to metrics. Context
+    lines (space prefix) are post-image content: the lexer must see them.
+    Deleted lines are dropped -- they do not exist in the resulting file,
+    so surrounding added lines become adjacent. Hunk headers, ``+++`` /
+    ``---`` file headers, ``diff --git``, and ``\\ No newline`` markers
+    are gaps: lexical state is unknown on the other side.
     """
 
-    extracted: list[str | None] = []
+    extracted: list[_PatchLine] = []
     for line in patch.splitlines():
-        if line.startswith("+") and not line.startswith("+++"):
-            extracted.append(line[1:])
-        elif line.startswith("-") and not line.startswith("---"):
+        if line.startswith("+++") or line.startswith("---"):
+            extracted.append(_PatchLine("gap", ""))
+        elif line.startswith("+"):
+            extracted.append(_PatchLine("added", line[1:]))
+        elif line.startswith("-"):
             continue
+        elif line.startswith(" "):
+            extracted.append(_PatchLine("context", line[1:]))
         else:
-            extracted.append(None)
+            extracted.append(_PatchLine("gap", ""))
     return extracted
 
 
@@ -361,11 +513,15 @@ def _tally_patch(patch: str, profile: _Profile) -> _FileTally:
     code_lines = 0
     current_block = 0
     largest_block = 0
-    for content in _added_lines(patch):
-        if content is None:
+    for item in _iter_patch_lines(patch):
+        if item.kind == "gap":
+            state = _ScanState()
             current_block = 0
             continue
-        kind = _scan_line(content, state, profile)
+        kind = _scan_line(item.content, state, profile)
+        if item.kind != "added":
+            current_block = 0
+            continue
         if kind == _KIND_BLANK:
             current_block = 0
         elif kind == _KIND_COMMENT:
@@ -453,11 +609,12 @@ def analyze_added_comments(
             :class:`reviewgate.core.config.CodeCommentPolicy`.
 
     Returns:
-        A :class:`CommentAnalysis` whose ``warnings`` are ordered: one
-        ``oversized_comment_block`` warning per eligible file that reaches
-        a block threshold (input order), then ``excessive_comment_lines``,
-        then ``comment_heavy_diff``. Thresholds are inclusive lower bounds,
-        matching :func:`reviewgate.core.size.size_warnings`.
+        A :class:`CommentAnalysis` whose ``warnings`` are ordered: at most
+        one ``oversized_comment_block`` for the PR-wide maximum (filename
+        of the first file that attains it, in input order), then
+        ``excessive_comment_lines``, then ``comment_heavy_diff``.
+        Thresholds are inclusive lower bounds, matching
+        :func:`reviewgate.core.size.size_warnings`.
 
     Raises:
         ValueError: If ``files`` and ``file_categories`` lengths differ
@@ -470,20 +627,20 @@ def analyze_added_comments(
             f"(got {len(files)} files vs {len(file_categories)} rows)"
         )
 
-    tallies: list[tuple[ChangedFile, _FileTally]] = []
     total_comment = 0
     total_code = 0
     largest_block = 0
+    largest_block_file: str | None = None
     for file, row in zip(files, file_categories, strict=True):
         profile = _eligible(file, row)
         if profile is None or file.patch is None:
             continue
         tally = _tally_patch(file.patch, profile)
-        tallies.append((file, tally))
         total_comment += tally.comment_lines
         total_code += tally.code_lines
         if tally.largest_block > largest_block:
             largest_block = tally.largest_block
+            largest_block_file = file.filename
 
     stats = CommentStats(
         comment_lines_added=total_comment,
@@ -493,8 +650,8 @@ def analyze_added_comments(
     )
 
     warnings: list[EngineWarning] = []
-    for file, tally in tallies:
-        warning = _block_warning(file.filename, tally.largest_block, policy)
+    if largest_block_file is not None:
+        warning = _block_warning(largest_block_file, largest_block, policy)
         if warning is not None:
             warnings.append(warning)
     warnings.extend(_total_warning(total_comment, policy))
@@ -516,7 +673,7 @@ def _block_warning(
     block_lines: int,
     policy: CodeCommentPolicy,
 ) -> EngineWarning | None:
-    """Build one per-file ``oversized_comment_block`` warning, or ``None``."""
+    """Build the single PR-level ``oversized_comment_block`` warning, or ``None``."""
 
     if block_lines <= 0:
         return None
@@ -538,8 +695,8 @@ def _block_warning(
         code=WARN_CODE_OVERSIZED_BLOCK,
         severity=severity,
         message=(
-            f"Source file {filename} adds a {block_lines}-line consecutive "
-            f"comment block, exceeding the configured {tier} threshold of "
+            f"PR adds a {block_lines}-line consecutive comment block in "
+            f"{filename}, exceeding the configured {tier} threshold of "
             f"{threshold} lines."
         ),
         evidence={
