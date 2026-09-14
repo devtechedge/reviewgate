@@ -304,8 +304,11 @@ what wrote it. It reads the optional unified diff in
 `ChangedFile.patch`. Only added lines contribute to metrics; deleted
 lines are dropped. Unchanged context lines are scanned so lexical state
 (open `/* */` blocks, strings, heredocs) stays accurate, but they are
-never tallied. Hunk headers and other diff metadata reset lexical state
-because the post-image between hunks is unknown.
+never tallied. A hunk whose new-file start line is greater than 1 does
+not establish that its first visible line is outside a pre-existing
+string, comment, or heredoc, so those hunks are skipped entirely
+(unknown entry state must not emit warnings). Hunks that start at
+new-file line 0 or 1 are known-normal and are analyzed.
 
 Scope and parsing rules (conservative by design; false negatives are
 preferred):
@@ -313,8 +316,11 @@ preferred):
 * Only files the categorizer marks `source` and `human_authored` are
   analyzed -- docs, generated, vendored, minified, snapshot, asset,
   lockfile, and manifest files are excluded.
-* Supported comment syntaxes: `#` (Python, Shell), `//` and `/* */`
-  (Go, JavaScript, TypeScript, Java, C, C++, C#, Rust). A small lexical
+* Supported comment syntaxes are those whose multiline string forms the
+  scanner actually models: `#` (Python, Shell) and `//` / `/* */`
+  (JavaScript, TypeScript without JSX/TSX, Go). Java, C, C++, C#, Rust,
+  and JSX/TSX are skipped until their raw strings, text blocks, and JSX
+  text can be classified without false positives. A small lexical
   scanner tracks string literals -- including JS/Go backtick strings and
   shell quotes/heredocs -- so `url = "https://example.com"`,
   `pattern = "#[a-z]+"`, template-literal bodies, and heredoc bodies are

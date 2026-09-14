@@ -37,18 +37,22 @@ should be considered stable but subject to additive change.
   and `comment_heavy_diff` warnings from the added lines of
   `ChangedFile.patch` only. Eligibility reuses the categorizer's
   `source` + `human_authored` verdict; a conservative lexical scanner
-  recognizes full-line `#` / `//` / `/* */` comments in Python, Shell, Go,
-  JS/TS, Java, C/C++, C#, and Rust while never counting string literals
-  (including Python docstrings) or trailing comments. Configured via the
-  new `policy.code_comments` block (warn/fail thresholds, ratio sample-size
-  guard, `enabled` toggle); adds `comment_lines_added`, `code_lines_added`,
+  recognizes full-line `#` / `//` / `/* */` comments in Python, Shell,
+  JavaScript, TypeScript (not JSX/TSX), and Go while never counting
+  string literals (including Python docstrings) or trailing comments.
+  Java, C/C++, C#, Rust, and JSX/TSX are skipped until their multiline
+  string forms are modeled. Configured via the new `policy.code_comments`
+  block (warn/fail thresholds, ratio sample-size guard, `enabled` toggle);
+  adds `comment_lines_added`, `code_lines_added`,
   `largest_comment_block_lines`, and `comment_ratio` stats when enabled,
   and maps no new labels (existing §10.13 aggregation is unchanged).
   Follow-up to the #144 review: unchanged context lines participate in
-  lexical classification without being tallied; hunk gaps reset scanner
-  state; JS/Go backtick strings and shell quotes/heredocs carry across
-  lines; `oversized_comment_block` is one PR-level warning for the
-  maximum block (filename in evidence), matching `size_warnings`.
+  lexical classification without being tallied; hunks whose new-file
+  start line is greater than 1 are skipped (unknown entry state must
+  not emit warnings); JS/Go backtick strings and shell quotes/heredocs
+  carry across lines; `oversized_comment_block` is one PR-level warning
+  for the maximum block (filename in evidence), matching `size_warnings`;
+  `files` / `file_categories` pairs are rejected when filenames differ.
 - **OSS polish (issue #126):** [`GOVERNANCE.md`](GOVERNANCE.md); canonical
   hosted-stack local guide [`docs/HOSTED_LOCAL.md`](docs/HOSTED_LOCAL.md) with
   README cross-links (including Dependabot, already configured in

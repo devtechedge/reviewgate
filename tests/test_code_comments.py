@@ -7,8 +7,9 @@ Locks the deterministic excessive-comment-verbosity heuristic end to end:
   penalised for historical comments it did not touch.
 * **Conservative classification**: string content (including JS/Go
   backtick strings and shell quotes/heredocs), docstrings, trailing
-  comments, and unsupported languages are never counted; false negatives
-  are preferred over false positives.
+  comments, mid-file hunks with unknown entry state, and unsupported
+  languages (including unmodeled C-family / JSX suffixes) are never
+  counted; false negatives are preferred over false positives.
 * **One warning per dimension**: ``oversized_comment_block`` is a single
   PR-level warning for the maximum block (filename in evidence), matching
   :func:`reviewgate.core.size.size_warnings`.
@@ -261,7 +262,7 @@ class TestConservativeClassification:
 class TestBlockSemantics:
     def test_c_style_block_comment_lines_form_a_block(self) -> None:
         patch = _diff("/* opening", " * continued", " */", "code();")
-        result = _analyze([("src/main.rs", patch, _row("src/main.rs"))])
+        result = _analyze([("src/main.go", patch, _row("src/main.go"))])
         assert result.stats.largest_comment_block_lines == 3
 
     def test_multiple_separate_blocks_report_largest(self) -> None:
@@ -319,7 +320,7 @@ class TestContextAwareLexicalState:
                 *[f"+int value_{i} = {i};" for i in range(12)],
             ]
         )
-        result = _analyze([("src/main.c", patch, _row("src/main.c"))])
+        result = _analyze([("src/main.go", patch, _row("src/main.go"))])
         assert result.stats.comment_lines_added == 1
         assert result.stats.code_lines_added == 12
         assert result.stats.largest_comment_block_lines == 1
@@ -355,13 +356,47 @@ class TestContextAwareLexicalState:
                 "+int x = 0;",
             ]
         )
-        result = _analyze([("src/main.c", patch, _row("src/main.c"))])
+        result = _analyze([("src/main.go", patch, _row("src/main.go"))])
         assert result.stats.comment_lines_added == 2
         assert result.stats.code_lines_added == 1
 
-    def test_hunk_gap_resets_lexical_state(self) -> None:
-        """The post-image between hunks is unknown; carrying an unclosed
-        `/*` across `@@` would invent commentary. Reset is conservative."""
+    def test_mid_file_hunk_does_not_assume_normal_state(self) -> None:
+        """Reviewer reproduction: a hunk whose opener sits above Git's
+        context window must not treat added `#` lines as comments."""
+
+        patch = "\n".join(
+            [
+                "@@ -100,3 +100,13 @@",
+                " existing docstring text",
+                "+# payload 0",
+                *[f"+# payload {i}" for i in range(1, 10)],
+                " more docstring text",
+                ' """',
+            ]
+        )
+        result = _analyze([("src/app.py", patch, _row("src/app.py"))])
+        assert result.stats.comment_lines_added == 0
+        assert result.warnings == []
+
+    def test_file_start_hunk_is_still_analyzed(self) -> None:
+        """New-file line 1 is known-normal; skipping every hunk would
+        disable the heuristic on ordinary patches."""
+
+        patch = "\n".join(
+            [
+                "@@ -1,1 +1,3 @@",
+                "+# real comment",
+                "+x = 1",
+            ]
+        )
+        result = _analyze([("src/app.py", patch, _row("src/app.py"))])
+        assert result.stats.comment_lines_added == 1
+        assert result.stats.code_lines_added == 1
+
+    def test_mid_file_hunk_is_skipped_not_reset_to_normal(self) -> None:
+        """A later hunk cannot inherit 'normal' from a default ScanState.
+        Hunk 1 starts at line 1 and is counted; hunk 2 starts at line 20
+        and must not contribute metrics."""
 
         patch = "\n".join(
             [
@@ -371,9 +406,9 @@ class TestContextAwareLexicalState:
                 "+int x = 0;",
             ]
         )
-        result = _analyze([("src/main.c", patch, _row("src/main.c"))])
+        result = _analyze([("src/main.go", patch, _row("src/main.go"))])
         assert result.stats.comment_lines_added == 1
-        assert result.stats.code_lines_added == 1
+        assert result.stats.code_lines_added == 0
 
 
 # --- multiline strings / heredocs (PR #144 review) -------------------------------
@@ -446,6 +481,48 @@ class TestMultilineStrings:
         result = _analyze([("src/app.js", patch, _row("src/app.js"))])
         assert result.stats.comment_lines_added == 1
         assert result.stats.code_lines_added == 3
+
+    def test_rust_raw_string_is_skipped_not_miscounted(self) -> None:
+        """Rust is advertised only when its raw-string state exists. Until
+        then the suffix is unsupported, so `r#\" // \"#` cannot warn."""
+
+        patch = _diff(
+            'let payload = r#"',
+            *["// payload %d" % i for i in range(12)],
+            '"#;',
+        )
+        result = _analyze([("src/main.rs", patch, _row("src/main.rs"))])
+        assert result.stats.comment_lines_added == 0
+        assert result.warnings == []
+
+    def test_java_text_block_is_skipped_not_miscounted(self) -> None:
+        patch = _diff(
+            'String payload = """',
+            *["// payload %d" % i for i in range(12)],
+            '""";',
+        )
+        result = _analyze([("src/Main.java", patch, _row("src/Main.java"))])
+        assert result.stats.comment_lines_added == 0
+        assert result.warnings == []
+
+    def test_jsx_is_skipped_until_jsx_text_is_modeled(self) -> None:
+        patch = _diff("export const n = 1;", "// not analyzed")
+        result = _analyze([("src/app.tsx", patch, _row("src/app.tsx"))])
+        assert result.stats.comment_lines_added == 0
+
+    @pytest.mark.parametrize(
+        "filename",
+        ["src/main.c", "src/main.cpp", "src/Main.cs", "src/app.jsx"],
+    )
+    def test_remaining_unmodeled_suffixes_are_skipped(self, filename: str) -> None:
+        """C, C++, C#, and JSX were advertised with the C-family profile
+        but their raw strings / JSX text are not modeled, so they must
+        not emit comment warnings (issue #143)."""
+
+        patch = _diff(*["// payload %d" % i for i in range(12)])
+        result = _analyze([(filename, patch, _row(filename))])
+        assert result.stats.comment_lines_added == 0
+        assert result.warnings == []
 
 
 # --- threshold ladder -------------------------------------------------------------
@@ -754,6 +831,12 @@ class TestFileEligibility:
         files = [_changed("src/app.py", None)]
         rows = [_row("src/app.py"), _row("src/other.py")]
         with pytest.raises(ValueError, match="one-to-one"):
+            analyze_added_comments(files, rows, _policy())
+
+    def test_filename_mismatch_is_rejected(self) -> None:
+        files = [_changed("generated/model.py", _diff("# generated"))]
+        rows = [_row("src/human.py")]
+        with pytest.raises(ValueError, match="pair by filename"):
             analyze_added_comments(files, rows, _policy())
 
 

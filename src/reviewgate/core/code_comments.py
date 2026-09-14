@@ -20,13 +20,19 @@ Conservative-parsing contract (false negatives preferred):
   dropped (they are gone in the post-image, so surrounding added lines
   become adjacent). Unchanged context lines are **scanned** so lexical
   state (open ``/* */`` blocks, strings, heredocs) stays accurate, but
-  they are never tallied. Hunk headers and other diff metadata are
-  unknown regions: they reset lexical state and terminate comment-block
-  runs.
+  they are never tallied.
+* A hunk whose new-file start line is greater than 1 does not establish
+  that its first visible line is outside a pre-existing string, comment,
+  or heredoc. Those hunks are skipped entirely (no scan, no tally):
+  unknown entry state must not emit warnings. Hunks that start at new-file
+  line 0 or 1 are known-normal and are analyzed.
 * Only files the categorizer marks ``human_authored`` **and** ``source``,
   written in a supported language (by extension), are analyzed. Docs,
   generated, vendored, minified, snapshot, asset, lockfile, manifest, and
-  unknown-language files are skipped.
+  unknown-language files are skipped. Supported extensions are those whose
+  multiline string forms the scanner actually models: Python, Shell,
+  JavaScript, TypeScript (not JSX/TSX), and Go. Other C-family suffixes
+  are skipped rather than guessed.
 * A line counts as a comment only when it is an *unmistakable full-line*
   comment (``#``, ``//``, or a ``/* ... */`` block line) at a lexical
   position where a comment can exist. A small single-pass scanner tracks
@@ -50,6 +56,7 @@ Pure: stdlib only, no I/O, no GitHub or LLM dependency (§4.1 boundary).
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Final, Literal
 
@@ -86,25 +93,11 @@ _SEVERITY_WARN: Final[WarningSeverity] = "medium"
 
 _SHELL_EXTENSIONS: Final[frozenset[str]] = frozenset({".sh", ".bash", ".zsh"})
 _PYTHON_EXTENSIONS: Final[frozenset[str]] = frozenset({".py"})
-# JS/TS/Go own backtick strings (template literals / raw strings). The rest
-# of the C-like family shares `//` and `/* */` but must not treat `` ` `` as
-# a string opener (Java, C, C++, C#, Rust).
+# Only extensions whose multiline string forms this scanner actually models.
+# JSX/TSX text, Rust/C++/C#/Java raw strings and text blocks are omitted
+# until they can be classified without false positives (issue #143).
 _JS_GO_EXTENSIONS: Final[frozenset[str]] = frozenset(
-    {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".go"}
-)
-_C_FAMILY_EXTENSIONS: Final[frozenset[str]] = frozenset(
-    {
-        ".java",
-        ".c",
-        ".h",
-        ".cpp",
-        ".cc",
-        ".cxx",
-        ".hpp",
-        ".hh",
-        ".cs",
-        ".rs",
-    },
+    {".js", ".mjs", ".cjs", ".ts", ".go"}
 )
 
 
@@ -135,9 +128,6 @@ _JS_GO_PROFILE: Final[_Profile] = _Profile(
     triple_strings=False,
     backtick_strings=True,
 )
-_C_FAMILY_PROFILE: Final[_Profile] = _Profile(
-    hash_comments=False, c_comments=True, triple_strings=False
-)
 
 
 def _profile_for(filename: str) -> _Profile | None:
@@ -154,8 +144,6 @@ def _profile_for(filename: str) -> _Profile | None:
         return _SHELL_PROFILE
     if ext in _JS_GO_EXTENSIONS:
         return _JS_GO_PROFILE
-    if ext in _C_FAMILY_EXTENSIONS:
-        return _C_FAMILY_PROFILE
     return None
 
 
@@ -164,11 +152,11 @@ def _profile_for(filename: str) -> _Profile | None:
 
 @dataclass
 class _ScanState:
-    """Lexical state carried across post-image lines of one file patch.
+    """Lexical state carried across post-image lines of one known hunk.
 
-    Context lines update this state without contributing to metrics. Hunk
-    gaps replace the instance entirely because the unseen region between
-    hunks is unknown.
+    Context lines update this state without contributing to metrics.
+    Mid-file hunks are skipped rather than scanned from a default
+    instance: unknown entry state must not emit warnings.
     """
 
     in_block_comment: bool = False  # inside a `/* ... */` block (C-like)
@@ -479,21 +467,42 @@ class _FileTally:
     largest_block: int
 
 
+_HUNK_HEADER: Final[re.Pattern[str]] = re.compile(
+    r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@"
+)
+
+
+def _hunk_entry_is_known(header: str) -> bool:
+    """True when a hunk's first new-file line is the start of the file.
+
+    New-file line 0 or 1 is the only case where "normal" lexical state is
+    known. Any later start can sit inside a string, comment, or heredoc
+    whose opener is outside Git's context window; those hunks must not
+    emit comment metrics (issue #143: unknown syntax prefers false
+    negatives).
+    """
+
+    match = _HUNK_HEADER.match(header)
+    if match is None:
+        return False
+    return int(match.group(1)) <= 1
+
+
 def _iter_patch_lines(patch: str) -> list[_PatchLine]:
     """Classify unified-diff lines into added / context / gap.
 
     Added lines are the only ones that contribute to metrics. Context
-    lines (space prefix) are post-image content: the lexer must see them.
-    Deleted lines are dropped -- they do not exist in the resulting file,
-    so surrounding added lines become adjacent. Hunk headers, ``+++`` /
-    ``---`` file headers, ``diff --git``, and ``\\ No newline`` markers
-    are gaps: lexical state is unknown on the other side.
+    lines (space prefix) are post-image content: the lexer must see them
+    when the hunk's entry state is known. Deleted lines are dropped --
+    they do not exist in the resulting file, so surrounding added lines
+    become adjacent. Gap content is preserved so hunk headers can be
+    parsed; a mid-file hunk is skipped rather than assumed normal.
     """
 
     extracted: list[_PatchLine] = []
     for line in patch.splitlines():
         if line.startswith("+++") or line.startswith("---"):
-            extracted.append(_PatchLine("gap", ""))
+            extracted.append(_PatchLine("gap", line))
         elif line.startswith("+"):
             extracted.append(_PatchLine("added", line[1:]))
         elif line.startswith("-"):
@@ -501,7 +510,7 @@ def _iter_patch_lines(patch: str) -> list[_PatchLine]:
         elif line.startswith(" "):
             extracted.append(_PatchLine("context", line[1:]))
         else:
-            extracted.append(_PatchLine("gap", ""))
+            extracted.append(_PatchLine("gap", line))
     return extracted
 
 
@@ -513,10 +522,15 @@ def _tally_patch(patch: str, profile: _Profile) -> _FileTally:
     code_lines = 0
     current_block = 0
     largest_block = 0
+    known = False
     for item in _iter_patch_lines(patch):
         if item.kind == "gap":
             state = _ScanState()
             current_block = 0
+            if item.content.startswith("@@"):
+                known = _hunk_entry_is_known(item.content)
+            continue
+        if not known:
             continue
         kind = _scan_line(item.content, state, profile)
         if item.kind != "added":
@@ -617,8 +631,9 @@ def analyze_added_comments(
         :func:`reviewgate.core.size.size_warnings`.
 
     Raises:
-        ValueError: If ``files`` and ``file_categories`` lengths differ
-            (contract drift between the engine and the categorizer).
+        ValueError: If ``files`` and ``file_categories`` lengths differ, or
+            any paired ``filename`` values differ (the public API must not
+            apply one file's category verdict to another file's patch).
     """
 
     if len(files) != len(file_categories):
@@ -632,6 +647,11 @@ def analyze_added_comments(
     largest_block = 0
     largest_block_file: str | None = None
     for file, row in zip(files, file_categories, strict=True):
+        if file.filename != row.filename:
+            raise ValueError(
+                "code_comments: files and file_categories must pair by "
+                f"filename (got {file.filename!r} vs {row.filename!r})"
+            )
         profile = _eligible(file, row)
         if profile is None or file.patch is None:
             continue
