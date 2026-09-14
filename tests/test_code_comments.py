@@ -167,6 +167,45 @@ class TestAddedLinesOnly:
         result = _analyze([("src/app.py", patch, _row("src/app.py"))])
         assert result.stats.comment_lines_added == 1
 
+    def test_added_increment_operator_is_code_not_a_file_header(self) -> None:
+        """An added ``++i`` is rendered ``+++i`` and must stay a code line."""
+
+        patch = "\n".join(
+            [
+                "diff --git a/counter.js b/counter.js",
+                "--- a/counter.js",
+                "+++ b/counter.js",
+                "@@ -1,1 +1,3 @@",
+                " let i = 0;",
+                "+// bump the counter",
+                "+++i;",
+            ]
+        )
+        result = _analyze([("src/counter.js", patch, _row("src/counter.js"))])
+        assert result.stats.code_lines_added == 1
+        assert result.stats.comment_lines_added == 1
+
+    def test_deleted_decrement_operator_does_not_split_a_comment_run(
+        self,
+    ) -> None:
+        """A deleted ``--x`` is rendered ``---x`` and must not reset a run."""
+
+        patch = "\n".join(
+            [
+                "diff --git a/main.go b/main.go",
+                "--- a/main.go",
+                "+++ b/main.go",
+                "@@ -1,1 +1,4 @@",
+                "+// one",
+                "+// two",
+                "---x;",
+                "+// three",
+            ]
+        )
+        result = _analyze([("src/main.go", patch, _row("src/main.go"))])
+        assert result.stats.comment_lines_added == 3
+        assert result.stats.largest_comment_block_lines == 3
+
     def test_patch_with_only_deletions_yields_zero_stats(self) -> None:
         patch = "@@ -1,3 +1,0 @@\n-# old\n-# block\n-# gone"
         result = _analyze([("src/app.py", patch, _row("src/app.py"))])
