@@ -47,12 +47,27 @@ should be considered stable but subject to additive change.
   `largest_comment_block_lines`, and `comment_ratio` stats when enabled,
   and maps no new labels (existing §10.13 aggregation is unchanged).
   Follow-up to the #144 review: unchanged context lines participate in
-  lexical classification without being tallied; hunks whose new-file
-  start line is greater than 1 are skipped (unknown entry state must
-  not emit warnings); JS/Go backtick strings and shell quotes/heredocs
-  carry across lines; `oversized_comment_block` is one PR-level warning
-  for the maximum block (filename in evidence), matching `size_warnings`;
+  lexical classification without being tallied; JS/Go backtick strings
+  and shell quotes/heredocs carry across lines;
+  `oversized_comment_block` is one PR-level warning for the maximum
+  block (filename in evidence), matching `size_warnings`;
   `files` / `file_categories` pairs are rejected when filenames differ.
+  Hunks that do not start at new-file line 0 or 1 are no longer skipped
+  outright: they are analyzed once their own context lines establish a
+  normal code position (two consecutive context lines that all scan
+  clean), so an ordinary mid-file edit -- the case issue #143 describes
+  -- is measured instead of ignored. Unified-diff file headers are now
+  detected by position (everything before the first `@@` is preamble)
+  rather than by a `+++ ` / `--- ` content match, which closes collisions
+  with an added `++i` and a deleted shell `-- )`. An in-scope source file
+  whose language is not modeled now contributes its added non-blank
+  lines to the `comment_ratio` denominator (never the numerator), so an
+  unparsed language can no longer inflate the ratio. The scanner moved
+  to [`_comment_lex.py`](src/reviewgate/core/_comment_lex.py) and
+  [`_comment_scan.py`](src/reviewgate/core/_comment_scan.py), and the
+  `CodeComment*` policy models to
+  [`comment_policy.py`](src/reviewgate/core/comment_policy.py), keeping
+  every non-test source file under the CONTRIBUTING.md LOC preference.
 - **OSS polish (issue #126):** [`GOVERNANCE.md`](GOVERNANCE.md); canonical
   hosted-stack local guide [`docs/HOSTED_LOCAL.md`](docs/HOSTED_LOCAL.md) with
   README cross-links (including Dependabot, already configured in
