@@ -450,6 +450,200 @@ class TestContextAwareLexicalState:
         assert result.stats.code_lines_added == 0
 
 
+# --- hunk entry established from context (PR #144 review round 4) ----------------
+
+
+class TestHunkEntryEstablishedFromContext:
+    def test_mid_file_hunk_with_code_context_is_analyzed(self) -> None:
+        """Reviewer reproduction: an ordinary `git diff -U3` hunk on an
+        existing file (new-file start > 1) adding a 12-line block. Skipping
+        every mid-file hunk made the heuristic a no-op on the exact case
+        issue #143 exists to catch."""
+
+        patch = "\n".join(
+            [
+                "@@ -80,6 +80,23 @@ def handle():",
+                "     existing = 1",
+                "     other = 2",
+                "     third = 3",
+                *[f"+# comment line {i}" for i in range(12)],
+                "     tail = 4",
+            ]
+        )
+        result = _analyze([("src/app.py", patch, _row("src/app.py"))])
+        assert result.stats.comment_lines_added == 12
+        assert result.stats.largest_comment_block_lines == 12
+        assert [w.code for w in result.warnings] == [WARN_CODE_OVERSIZED_BLOCK]
+        assert result.warnings[0].severity == "medium"
+
+    def test_single_context_line_does_not_establish_entry_state(self) -> None:
+        """One context line proves nothing about where the hunk began: a
+        line of docstring prose and a line of code are indistinguishable on
+        their own, so this hunk must stay silent."""
+
+        patch = "\n".join(
+            [
+                "@@ -50,1 +50,3 @@",
+                " existing docstring text",
+                "+# payload 0",
+                "+# payload 1",
+            ]
+        )
+        result = _analyze([("src/app.py", patch, _row("src/app.py"))])
+        assert result.stats.comment_lines_added == 0
+        assert result.warnings == []
+
+    def test_two_clean_context_lines_establish_entry_state(self) -> None:
+        """A run of context lines that all scan clean is positive evidence
+        that the hunk starts at a normal code position."""
+
+        patch = "\n".join(
+            [
+                "@@ -50,2 +50,4 @@",
+                " value = 1",
+                " other = 2",
+                "+# real comment",
+                "+total = 3",
+            ]
+        )
+        result = _analyze([("src/app.py", patch, _row("src/app.py"))])
+        assert result.stats.comment_lines_added == 1
+        assert result.stats.code_lines_added == 1
+
+    def test_open_construct_context_never_establishes_entry_state(self) -> None:
+        """Three context lines are still no evidence when every one of them
+        sits inside an open heredoc, so the hunk contributes nothing at
+        all. Contrast with the two clean context lines above, which do
+        establish state on the same hunk shape."""
+
+        patch = "\n".join(
+            [
+                "@@ -10,5 +10,7 @@",
+                " cat <<EOF",
+                " body one",
+                " body two",
+                "+# inside the heredoc body",
+                "+another",
+                " EOF",
+            ]
+        )
+        result = _analyze([("scripts/run.sh", patch, _row("scripts/run.sh"))])
+        assert result.stats.comment_lines_added == 0
+        assert result.stats.code_lines_added == 0
+        assert result.warnings == []
+
+
+# --- file header detection by position (PR #144 review round 4) -------------------
+
+
+class TestDiffHeaderDetection:
+    def test_deleted_shell_case_arm_does_not_split_a_block(self) -> None:
+        """Reviewer reproduction: a deleted `-- ) shift ;;` is emitted as
+        `--- ) shift ;;`. Content-shaped header matching reclassified it as
+        a gap, which wiped lexer state and split the run at 3 instead of 4."""
+
+        patch = "\n".join(
+            [
+                "@@ -1,3 +1,8 @@",
+                "+# one",
+                "+# two",
+                "+# three",
+                "--- ) shift ;;",
+                "+# four",
+            ]
+        )
+        result = _analyze([("scripts/run.sh", patch, _row("scripts/run.sh"))])
+        assert result.stats.comment_lines_added == 4
+        assert result.stats.largest_comment_block_lines == 4
+
+    def test_added_increment_operator_counts_as_code(self) -> None:
+        """An added `++i` is emitted as `+++i` and must be tallied as code,
+        not swallowed as a file header."""
+
+        patch = "\n".join(
+            [
+                "@@ -1,2 +1,6 @@",
+                "+// a",
+                "+++i;",
+                "+// b",
+                "+let x = 1;",
+            ]
+        )
+        result = _analyze([("src/a.js", patch, _row("src/a.js"))])
+        assert result.stats.comment_lines_added == 2
+        assert result.stats.code_lines_added == 2
+        assert result.stats.largest_comment_block_lines == 1
+
+    def test_preamble_before_first_hunk_is_never_content(self) -> None:
+        """`--- a/...` and `+++ b/...` precede the first `@@`, so position
+        alone classifies them as preamble rather than as added or deleted
+        source lines."""
+
+        patch = "\n".join(
+            [
+                "--- a/src/app.py",
+                "+++ b/src/app.py",
+                "@@ -1,1 +1,4 @@",
+                "+# one",
+                "+# two",
+                "+x = 1",
+            ]
+        )
+        result = _analyze([("src/app.py", patch, _row("src/app.py"))])
+        assert result.stats.comment_lines_added == 2
+        assert result.stats.code_lines_added == 1
+        assert result.stats.largest_comment_block_lines == 2
+
+
+# --- ratio denominator covers unmodeled languages (PR #144 review round 4) --------
+
+
+class TestRatioDenominator:
+    def test_unmodeled_source_file_stays_in_the_denominator(self) -> None:
+        """Reviewer reproduction: 9 comment + 11 code lines in Python plus
+        100 code lines in Java is 9/120 ~= 0.075 at PR level. Dropping the
+        unmodeled file reported 0.45 and fired `comment_heavy_diff`."""
+
+        python_patch = "\n".join(
+            ["@@ -1,1 +1,21 @@"]
+            + [f"+# c{i}" for i in range(9)]
+            + [f"+code_{i} = {i}" for i in range(11)]
+        )
+        java_patch = "\n".join(
+            ["@@ -1,1 +1,101 @@"] + [f"+int v{i} = {i};" for i in range(100)]
+        )
+        result = _analyze(
+            [
+                ("src/a.py", python_patch, _row("src/a.py")),
+                ("src/B.java", java_patch, _row("src/B.java")),
+            ]
+        )
+        assert result.stats.comment_lines_added == 9
+        assert result.stats.code_lines_added == 111
+        assert result.stats.comment_ratio == round(9 / 120, 4)
+        assert result.warnings == []
+
+    def test_unmodeled_file_never_contributes_comment_lines(self) -> None:
+        """Comment syntax is not modeled for the language, so its `#` or
+        `//` lines may join the denominator but never the numerator."""
+
+        patch = "\n".join(["@@ -1,1 +1,3 @@", "+// not classified", "+int x = 1;"])
+        result = _analyze([("src/B.java", patch, _row("src/B.java"))])
+        assert result.stats.comment_lines_added == 0
+        assert result.stats.code_lines_added == 2
+
+    def test_ineligible_file_stays_out_of_the_denominator(self) -> None:
+        """A generated file is out of scope entirely: it must not be
+        counted as source just because its language is unmodeled."""
+
+        patch = "\n".join(["@@ -1,1 +1,3 @@", "+int x = 1;", "+int y = 2;"])
+        result = _analyze(
+            [("src/gen.java", patch, _row("src/gen.java", human_authored=False))]
+        )
+        assert result.stats.code_lines_added == 0
+        assert result.stats.comment_lines_added == 0
+
+
 # --- multiline strings / heredocs (PR #144 review) -------------------------------
 
 
